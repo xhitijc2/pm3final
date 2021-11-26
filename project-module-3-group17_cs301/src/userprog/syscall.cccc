@@ -1,0 +1,438 @@
+// START
+#include "userprog/syscall.h"
+#include "userprog/pagedir.h"
+#include <stdio.h>
+#include <syscall-nr.h>
+#include <stdlib.h>
+#include "threads/interrupt.h"
+#include "threads/thread.h"
+#include "threads/vaddr.h"
+#include "threads/synch.h"
+#include "devices/shutdown.h"
+#include "devices/block.h"
+// end
+// start
+
+const int filename_minimum_bound = 1;
+const int filename_maximum_bound = 14;
+
+// end
+// start
+
+typedef int pid_t;
+
+struct f_descptr
+{
+    int fd;
+    struct list_elem elemnt;
+    struct file *file;
+};
+
+static struct lock filesys_lock;
+
+// emd
+bool valid_pointer_function(const void *ptr);
+bool valid_filename_function(const void *file);
+
+static void system_call_handler_func(struct intr_frame *);
+
+// declaring the syscall functions
+// start
+
+static void halt(void);
+static int open(const char *file);
+
+static bool create(const char *file, unsigned initial_size);
+static bool remove(const char *file);
+static filesize(int fd);
+static int read(int fd, void *buffer, unsigned size);
+static pid_t exec(const char *cmd_line);
+static int wait(pid_t pid);
+static void close(int fd);
+
+static int write(int fd, const void *buffer, unsigned size);
+
+static void seek(int fd, unsigned position);
+static unsigned tell(int fd);
+// end
+// start
+void syscall_init(void)
+{
+    intr_register_int(0x30, 3, INTR_ON, system_call_handler_func, "syscall");
+    lock_init(&filesys_lock);
+}
+// end
+// start
+static void system_call_handler_func(struct intr_frame *f)
+{
+    uint32_t *esp = f->esp;
+    uint32_t *argv0 = esp + 1;
+    uint32_t *argv1 = esp + 2;
+    uint32_t *argv2 = esp + 3;
+    // if the pointer is invalid, then return -1
+    if (!valid_pointer_function(esp) || !valid_pointer_function(argv0) || !valid_pointer_function(argv1) || !valid_pointer_function(argv2))
+    {
+        exit(-1);
+    }
+
+    uint32_t system_call_identifier = *esp;
+    // check for various cases of system calls
+    switch (system_call_identifier)
+    {
+    case SYS_EXIT:
+        exit(*argv0);
+        break;
+    case SYS_CLOSE:
+        close(*argv0);
+        break;
+
+    case SYS_HALT:
+        halt();
+        break;
+    case SYS_WAIT:
+        f->eax = wait(*argv0);
+        break;
+    case SYS_OPEN:
+        f->eax = open((char *)*argv0);
+        break;
+
+    case SYS_EXEC:
+        f->eax = exec((char *)*argv0);
+        break;
+    case SYS_REMOVE:
+        f->eax = remove((char *)*argv0);
+        break;
+
+    case SYS_CREATE:
+        f->eax = create((char *)*argv0, *argv1);
+        break;
+    case SYS_SEEK:
+        seek(*argv0, *argv1);
+        break;
+
+    case SYS_FILESIZE:
+        f->eax = filesize(*argv0);
+        break;
+    case SYS_WRITE:
+        f->eax = write(*argv0, (void *)*argv1, *argv2);
+        break;
+
+    case SYS_READ:
+        f->eax = read(*argv0, (void *)*argv1, *argv2);
+        break;
+    case SYS_TELL:
+        f->eax = tell(*argv0);
+        break;
+    default:
+        break;
+    }
+}
+// end
+// start
+/* Checking whether a pointer is valid or not
+   Shouldnt be null, should not point to kernel mem, and shoyld not point to unmapped vm*/
+bool valid_pointer_function(const void *ptr)
+{
+    if (ptr == NULL || !is_user_vaddr(ptr) || pagedir_get_page(thread_current()->pagedir, ptr) == NULL)
+    {
+        return false;
+    }
+
+    return true;
+}
+// end
+// start - check whetehr filename is valid or nno
+bool valid_filename_function(const void *fileName)
+{
+    if (!valid_pointer_function(fileName))
+        exit(-1);
+
+    int length_of_fileName = strlen(fileName);
+    return length_of_fileName >= filename_minimum_bound && length_of_fileName <= filename_maximum_bound;
+}
+// end
+// start
+struct f_descptr *get_openfile(int fd)
+{
+    struct list *current_list = &thread_current()->open_fd;
+    for (struct list_elem *iter_elemnt = list_begin(current_list);
+         iter_elemnt != list_end(current_list);
+         iter_elemnt = list_next(iter_elemnt))
+    {
+        struct f_descptr *open_fd =
+            list_entry(iter_elemnt, struct f_descptr, elemnt);
+        if (open_fd->fd == fd)
+            return open_fd;
+        else if (open_fd->fd > fd)
+            return NULL;
+    }
+    return NULL;
+}
+// end
+// start
+void close_file(int fd)
+{
+    struct list *curr_list = &thread_current()->open_fd;
+    for (struct list_elem *iter_elemnt = list_begin(curr_list);
+         iter_elemnt != list_end(curr_list);
+         iter_elemnt = list_next(iter_elemnt))
+    {
+        struct f_descptr *curr_file =
+            list_entry(iter_elemnt, struct f_descptr, elemnt);
+        if (curr_file->fd == fd)
+        {
+            list_remove(iter_elemnt);
+            file_close(curr_file->file);
+            free(curr_file);
+            return;
+        }
+        else if (curr_file->fd > fd)
+            return;
+    }
+    return;
+}
+// end
+// START OF SYSCALL HALT FUNCTION - this call allows to reboot or stop the system
+static void halt(void)
+{
+    shutdown_power_off();
+}
+// END OF SYSCALL HALT FUNCITON
+// start of exit syscall
+/* Terminates the uprog and reports the status to the OS */
+void exit(int result)
+{
+    struct thread *current_thr = thread_current();
+    printf("%s: exit(%d)\n", current_thr->name, result);
+
+    if (current_thr->parent != NULL)
+    {
+        current_thr->parent->child_exit_status = result;
+    }
+
+    while (!list_empty(&current_thr->open_fd))
+    {
+        close(list_entry(list_begin(&current_thr->open_fd), struct f_descptr, elemnt)->fd);
+    }
+
+    file_close(current_thr->file);
+
+    thread_exit();
+}
+// end of exit syscall
+// start of exec syscall
+static pid_t exec(const char *commandLine)
+{
+    if (!valid_pointer_function(commandLine))
+        exit(-1);
+
+    lock_acquire(&filesys_lock);
+    tid_t thread_id = process_execute(commandLine);
+    lock_release(&filesys_lock);
+
+    return thread_id;
+}
+// end of exec syscall
+// start of wait syscall
+static int wait(pid_t process_id)
+{
+    return process_wait(process_id);
+}
+
+// end of wait syscall
+// start of create syscall
+/* Creates a new file and returns the status */
+static bool create(const char *file_name, unsigned size)
+{
+    if (!valid_filename_function(file_name))
+        return false;
+
+    lock_acquire(&filesys_lock);
+    block_sector_t i_nodesector = 0;
+    struct dir *directry = dir_open_root();
+    bool success = (directry != NULL && free_map_allocate(1, &i_nodesector) && inode_create(i_nodesector, size) && dir_add(directry, file_name, i_nodesector));
+    if (!success && i_nodesector != 0)
+        free_map_release(i_nodesector, 1);
+    dir_close(directry);
+
+    lock_release(&filesys_lock);
+
+    return success;
+    // return status;
+}
+// end of create syscall
+// start of remove syscall
+/* delete the file with filename and return the status */
+static bool remove(const char *file_name)
+{
+    if (!valid_filename_function(file_name))
+        return false;
+    bool reslt;
+    lock_acquire(&filesys_lock);
+    reslt = filesys_remove(file_name);
+    lock_release(&filesys_lock);
+    return reslt;
+}
+// end of remove syscall
+// start of assing fd
+/* give a unique fd to file */
+int assign_fd()
+{
+    struct list *curr_list = &thread_current()->open_fd;
+    if (list_empty(curr_list))
+        return 2;
+    else
+    {
+        struct f_descptr *fle =
+            list_entry(list_back(curr_list), struct f_descptr, elemnt);
+        // printf("fd : %d\n", f->fd);
+        // assume there are sufficient fd space
+        return fle->fd + 1;
+    }
+}
+// end of assing fd
+
+/* fd values comparator*/
+// start of comparator function
+bool compare_fds(const struct list_elem *a, const struct list_elem *b, void *aux)
+{
+    struct f_descptr *A = list_entry(a, struct f_descptr, elemnt);
+    struct f_descptr *B = list_entry(b, struct f_descptr, elemnt);
+    return A->fd < B->fd;
+}
+
+// end of comparator function
+// start of open function
+static int open(const char *file_Name)
+{
+
+    if (!valid_filename_function(file_Name))
+        return -1;
+    int fd;
+    lock_acquire(&filesys_lock);
+    struct list *currList = &thread_current()->open_fd;
+    struct file *current_open_file = filesys_open(file_Name);
+    if (current_open_file != NULL)
+    {
+        struct f_descptr *temp = malloc(sizeof(struct f_descptr));
+        temp->fd = assign_fd();
+        temp->file = current_open_file;
+        fd = temp->fd;
+        list_insert_ordered(currList, &temp->elemnt, (list_less_func *)compare_fds, NULL);
+    }
+    lock_release(&filesys_lock);
+
+    return fd;
+}
+// end of open function
+
+/* Close file of fd. */
+// start of close function
+static void close(int fd)
+{
+    lock_acquire(&filesys_lock);
+    close_file(fd);
+    lock_release(&filesys_lock);
+}
+// end of close function
+
+/* get size of fd and return it */
+// start of fileszie function
+static int filesize(int fd)
+{
+    int sz = -1;
+
+    lock_acquire(&filesys_lock);
+
+    struct f_descptr *f_descptr = get_openfile(fd);
+    if (f_descptr != NULL)
+        sz = file_length(f_descptr->file);
+
+    lock_release(&filesys_lock);
+
+    return sz;
+}
+// end of fileszie function
+
+/* read and return the number of bytes read */
+// start of read syscall fucntion
+static int read(int fd, void *bfr, unsigned sz)
+{
+    int result = -1;
+
+    if (!valid_pointer_function(bfr) || !valid_pointer_function(bfr + sz - 1))
+        exit(-1);
+
+    lock_acquire(&filesys_lock);
+    if (fd == STDIN_FILENO)
+    {
+        uint8_t *p = bfr;
+        uint8_t c;
+        unsigned cntr = 0;
+        while (cntr < sz && (c = input_getc()) != 0)
+        {
+            *p = c;
+            p++;
+            cntr++;
+        }
+        *p = 0;
+        result = sz - cntr;
+    }
+    else if (fd != STDOUT_FILENO)
+    {
+        struct f_descptr *f_descptr = get_openfile(fd);
+        if (f_descptr != NULL)
+            result = file_read(f_descptr->file, bfr, sz);
+    }
+
+    lock_release(&filesys_lock);
+
+    return result;
+}
+// end of read syscall function
+// start of write function
+static int write(int fd, const void *bfr, unsigned sz)
+{
+    int result = 0;
+    if (bfr == NULL || !valid_pointer_function(bfr) || !valid_pointer_function(bfr + sz - 1))
+        exit(-1);
+
+    lock_acquire(&filesys_lock);
+    if (fd == STDOUT_FILENO)
+    {
+        putbuf(bfr, sz);
+        result = sz;
+    }
+    else if (fd != STDIN_FILENO)
+    {
+        struct f_descptr *f_descptr = get_openfile(fd);
+        if (f_descptr != NULL)
+            result = file_write(f_descptr->file, bfr, sz);
+    }
+    lock_release(&filesys_lock);
+    return result;
+}
+// end of write function
+// start of seek function
+static void seek(int fd, unsigned loc)
+{
+    lock_acquire(&filesys_lock);
+    struct f_descptr *f_descptr = get_openfile(fd);
+    if (f_descptr != NULL)
+        file_seek(f_descptr->file, loc);
+    lock_release(&filesys_lock);
+    return;
+}
+// end of seek function
+// start of tell function
+static unsigned tell(int fd)
+{
+    int result = -1;
+    lock_acquire(&filesys_lock);
+    struct f_descptr *f_descptr = get_openfile(fd);
+    if (f_descptr != NULL)
+        result = file_tell(f_descptr->file);
+    lock_release(&filesys_lock);
+    return result;
+}
+// end of tell function
